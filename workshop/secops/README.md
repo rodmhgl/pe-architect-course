@@ -123,17 +123,20 @@ kubectl logs -n falco-system daemonset/falco | grep "Privileged container"
 Now let's add custom security rules for detecting specific threats:
 
 ```bash
-# Create custom rule file and deploy with Falco
+# Upgrade Falco to load the custom rules into its pods
 helm upgrade falco falcosecurity/falco \
   --namespace falco-system \
-  --set driver.kind=modern_ebpf \
-  --set falco.grpc.enabled=true \
-  --set falco.grpcOutput.enabled=true \
-  --set-file customRules."custom_rules\.yaml"=./root-detect-rule.yaml
+  --reuse-values \
+  --set-file 'customRules.custom_rules\.yaml'=custom_rules.yaml
 ```
+
+> `--reuse-values` preserves the existing `driver.kind=modern_ebpf` and gRPC settings. The `customRules` key causes Helm to mount the rules content into `/etc/falco/rules.d/` inside Falco pods, which Falco loads on startup.
 
 **Verify custom rules are loaded**:
 ```bash
+# Wait for Falco pods to restart with the new rules
+kubectl rollout status daemonset/falco -n falco-system
+
 # Check Falco logs for rule loading
 kubectl logs -n falco-system daemonset/falco | grep -i "rules"
 
@@ -141,11 +144,9 @@ kubectl logs -n falco-system daemonset/falco | grep -i "rules"
 ```
 
 **Understanding the custom rule**:
-The `root-detect-rule.yaml` contains rules for detecting:
-- Root user executions in containers
-- Suspicious file access patterns
-- Network connections from containers
-- Privilege escalation attempts
+The `custom_rules.yaml` file contains rules for detecting:
+- Containers running as root (UID 0) in any namespace
+- Root processes in non-system namespaces
 
 ### Step 4: Add Security Constraint Template
 
@@ -153,22 +154,20 @@ Create a security constraint template that works with Falco:
 
 ```bash
 # Apply security constraint template
-kubectl apply -f security-constraint-template.yaml
+kubectl apply -f constraint-template.yaml
 ```
 
 **Verify the template**:
 ```bash
 # Check that security template is created
-kubectl get constrainttemplates | grep -i security
+kubectl get constrainttemplates | grep falcorootprevention
 
 # Should show the new security template
 ```
 
 **What this template does**:
-- Prevents deployment of privileged containers
-- Requires security contexts for all containers
-- Blocks containers running as root
-- Enforces read-only root filesystems
+- Blocks containers running as root (UID 0 or unspecified)
+- Blocks privileged containers
 
 ### Step 5: Apply Security Constraint
 
@@ -176,16 +175,16 @@ Apply the constraint that uses our security template:
 
 ```bash
 # Apply security constraint
-kubectl apply -f security-constraint.yaml
+kubectl apply -f constraint.yaml
 ```
 
 **Verify constraint is enforcing**:
 ```bash
 # Check that constraint exists and is active
-kubectl get constraints | grep -i security
+kubectl get constraints | grep enforce-falco-root-prevention
 
 # Check constraint status
-kubectl describe constraint <security-constraint-name>
+kubectl describe falcorootprevention.constraints.gatekeeper.sh/enforce-falco-root-prevention
 ```
 
 ### Step 6: Test Security Detection and Prevention
@@ -211,7 +210,7 @@ kubectl logs -n falco-system daemonset/falco | tail -20
 **Test 2: Admission Prevention (Gatekeeper)**
 ```bash
 # This should FAIL - blocked by security constraint
-kubectl apply -f deployment-insecure.yaml
+kubectl apply -f deployment.yaml
 
 # Expected error about security policy violations
 ```
@@ -219,10 +218,10 @@ kubectl apply -f deployment-insecure.yaml
 **Test 3: Compliant Deployment**
 ```bash
 # This should SUCCEED - meets security requirements
-kubectl apply -f deployment-secure.yaml
+kubectl apply -f deployment-works.yaml
 
 # Verify deployment
-kubectl get deployment secure-app
+kubectl get deployment secure-nonroot-app
 ```
 
 ## ✅ Verification Steps
@@ -239,19 +238,19 @@ kubectl get daemonset -n falco-system
 kubectl logs -n falco-system daemonset/falco | tail -10
 
 # Verify custom rules are loaded
-kubectl logs -n falco-system daemonset/falco | grep "custom_rules"
+kubectl logs -n falco-system daemonset/falco | grep -i "rules"
 ```
 
 **2. Security Constraints**:
 ```bash
 # Verify security constraint template exists
-kubectl get constrainttemplates | grep -i security
+kubectl get constrainttemplates | grep falcorootprevention
 
 # Verify security constraint is enforcing
-kubectl get constraints | grep -i security
+kubectl get constraints | grep enforce-falco-root-prevention
 
 # Test constraint enforcement
-kubectl apply -f deployment-insecure.yaml
+kubectl apply -f deployment.yaml
 # Should be blocked with security violations
 ```
 
@@ -263,13 +262,13 @@ kubectl run security-test --image=busybox --rm -it -- sh
 # Check logs: kubectl logs -n falco-system daemonset/falco | tail -5
 
 # Test admission prevention
-kubectl apply -f deployment-insecure.yaml
+kubectl apply -f deployment.yaml
 # Should fail with security policy errors
 
 # Test compliant deployment
-kubectl apply -f deployment-secure.yaml
+kubectl apply -f deployment-works.yaml
 # Should succeed
-kubectl get deployment secure-app
+kubectl get deployment secure-nonroot-app
 ```
 
 ### Success Criteria ✅
@@ -287,7 +286,7 @@ Your security operations setup is working when:
 
 ### Custom Falco Rules
 
-Add organization-specific detection rules in `custom_rules.yaml`:
+Add organization-specific detection rules to `custom_rules.yaml`:
 
 ```yaml
 # Example custom rule
@@ -344,13 +343,13 @@ falco:
 **Diagnosis**:
 ```bash
 # Check pod status and events
-kubectl describe pod -n falco-system <falco-pod-name>
+kubectl describe pod -n falco-system -l app.kubernetes.io/instance=falco
 
 # Check node resources
 kubectl top nodes
 
 # Verify eBPF support
-kubectl logs -n falco-system <falco-pod-name> | grep -i ebpf
+kubectl logs -n falco-system -l app.kubernetes.io/instance=falco | grep -i ebpf
 ```
 
 **Solutions**:
@@ -408,7 +407,7 @@ kubectl describe constraint <constraint-name>
 kubectl rollout restart deployment -n gatekeeper-system gatekeeper-controller-manager
 
 # Re-apply constraint template
-kubectl apply -f security-constraint-template.yaml
+kubectl apply -f constraint-template.yaml
 ```
 
 #### 4. High Resource Usage
